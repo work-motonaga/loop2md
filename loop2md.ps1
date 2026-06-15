@@ -1,0 +1,363 @@
+﻿param(
+    [string]$OutDir = ".",
+    [string]$OutFileName
+)
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = "Stop"
+
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName PresentationCore
+
+function Get-JapaneseReadableScore {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $jpCount = ([regex]::Matches($Text, "[ぁ-んァ-ヶ一-龯]", "IgnoreCase")).Count
+    $badCount = ([regex]::Matches($Text, "縺|繧|繝|荳|螟|莉|譛|�", "IgnoreCase")).Count
+    return ($jpCount * 2) - $badCount
+}
+
+function Repair-MojibakeIfNeeded {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Text
+    )
+
+    $cp932 = [Text.Encoding]::GetEncoding(932)
+    $candidate = [Text.Encoding]::UTF8.GetString($cp932.GetBytes($Text))
+
+    $originalScore = Get-JapaneseReadableScore -Text $Text
+    $candidateScore = Get-JapaneseReadableScore -Text $candidate
+
+    if ($candidateScore -gt ($originalScore + 5)) {
+        return $candidate
+    }
+
+    return $Text
+}
+
+function Convert-ToSafeFileName {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name,
+
+        [string]$DefaultName = "output"
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Name)) {
+        return $DefaultName
+    }
+
+    $decoded = [Net.WebUtility]::HtmlDecode($Name)
+    $withoutTags = [regex]::Replace($decoded, '<[^>]+>', ' ')
+    $normalized = [regex]::Replace($withoutTags, '\s+', ' ').Trim()
+
+    $invalidChars = [IO.Path]::GetInvalidFileNameChars()
+    $invalidPattern = '[' + [regex]::Escape((-join $invalidChars)) + ']'
+    $safe = [regex]::Replace($normalized, $invalidPattern, '_')
+
+    # Avoid invalid trailing dots/spaces on Windows.
+    $safe = [regex]::Replace($safe, '[\. ]+$', '')
+
+    if ([string]::IsNullOrWhiteSpace($safe)) {
+        return $DefaultName
+    }
+
+    return $safe
+}
+
+function Get-AutoOutputBaseNameFromHtml {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Html
+    )
+
+    $titleMatch = [regex]::Match($Html, '(?is)<title[^>]*>(.*?)</title>')
+    if ($titleMatch.Success -and -not [string]::IsNullOrWhiteSpace($titleMatch.Groups[1].Value)) {
+        return Convert-ToSafeFileName -Name $titleMatch.Groups[1].Value -DefaultName "output"
+    }
+
+    $headingMatch = [regex]::Match($Html, '(?is)<h([1-6])\b[^>]*>(.*?)</h\1>')
+    if ($headingMatch.Success -and -not [string]::IsNullOrWhiteSpace($headingMatch.Groups[2].Value)) {
+        return Convert-ToSafeFileName -Name $headingMatch.Groups[2].Value -DefaultName "output"
+    }
+
+    $roleHeadingMatch = [regex]::Match($Html, '(?is)<([a-z0-9]+)\b[^>]*\brole\s*=\s*["'']heading["''][^>]*>(.*?)</\1>')
+    if ($roleHeadingMatch.Success -and -not [string]::IsNullOrWhiteSpace($roleHeadingMatch.Groups[2].Value)) {
+        return Convert-ToSafeFileName -Name $roleHeadingMatch.Groups[2].Value -DefaultName "output"
+    }
+
+    return "output"
+}
+
+function Normalize-LoopCodeBlocks {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Html
+    )
+
+    $codeBlockPattern = [regex]'(?is)<pre\b([^>]*)>\s*<code\b([^>]*)>(.*?)</code>\s*</pre>'
+    if (-not $codeBlockPattern.IsMatch($Html)) {
+        return $Html
+    }
+
+    $builder = New-Object System.Text.StringBuilder
+    $lastIndex = 0
+
+    foreach ($match in $codeBlockPattern.Matches($Html)) {
+        [void]$builder.Append($Html.Substring($lastIndex, $match.Index - $lastIndex))
+
+        $preAttrs = $match.Groups[1].Value
+        $codeAttrs = $match.Groups[2].Value
+        $innerHtml = $match.Groups[3].Value
+
+        $innerHtml = [regex]::Replace($innerHtml, '(?is)^<span[^>]*><!--ScriptorStartFragment-->', '')
+        $innerHtml = [regex]::Replace($innerHtml, '(?is)</span>\s*$', '')
+        $innerHtml = [regex]::Replace($innerHtml, '(?is)<div\s+class="scriptor-paragraph">\s*</div>', "`n")
+        $innerHtml = [regex]::Replace($innerHtml, '(?is)</div>\s*<div\s+class="scriptor-paragraph">', "`n")
+        $innerHtml = [regex]::Replace($innerHtml, '(?is)</?div[^>]*>', '')
+        $innerHtml = [regex]::Replace($innerHtml, '(?is)</?span[^>]*>', '')
+        $innerHtml = $innerHtml.Replace('&nbsp;', ' ')
+        $innerHtml = [Net.WebUtility]::HtmlDecode($innerHtml)
+        $innerHtml = $innerHtml -replace "`r`n?", "`n"
+        $innerHtml = [regex]::Replace($innerHtml, "`n{3,}", "`n`n")
+        $innerHtml = $innerHtml.Trim("`n")
+        $escapedText = [System.Security.SecurityElement]::Escape($innerHtml)
+
+        [void]$builder.Append("<pre$preAttrs><code$codeAttrs>$escapedText</code></pre>")
+        $lastIndex = $match.Index + $match.Length
+    }
+
+    [void]$builder.Append($Html.Substring($lastIndex))
+    return $builder.ToString()
+}
+
+function Normalize-MarkdownAndImages {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$MarkdownPath,
+
+        [Parameter(Mandatory = $true)]
+        [string]$ImagesDir
+    )
+
+    $mdText = Get-Content -LiteralPath $MarkdownPath -Raw -Encoding UTF8
+
+    # Remove standalone backslash lines generated by pandoc from Loop HTML breaks.
+    $mdText = [regex]::Replace($mdText, '(?m)^[ \t]*\\[ \t]*\r?\n?', '')
+
+    # Remove Loop-specific paragraph wrapper tags.
+    $mdText = [regex]::Replace($mdText, '(?im)^\s*<div class="scriptor-paragraph">\s*$', '')
+    $mdText = [regex]::Replace($mdText, '(?im)^\s*</div>\s*$', '')
+
+    if (-not (Test-Path -LiteralPath $ImagesDir)) {
+        [IO.File]::WriteAllText($MarkdownPath, $mdText, [Text.UTF8Encoding]::new($false))
+        return
+    }
+
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    $orderedLeafNames = New-Object 'System.Collections.Generic.List[string]'
+
+    $imgMatches = [regex]::Matches($mdText, '(?i)<img\b[^>]*\bsrc="([^"]+)"')
+    foreach ($m in $imgMatches) {
+        $src = $m.Groups[1].Value
+        $normalizedSrc = $src.Replace('/', '\\')
+        $leaf = [IO.Path]::GetFileName($normalizedSrc)
+        if (-not [string]::IsNullOrWhiteSpace($leaf) -and $seen.Add($leaf)) {
+            $orderedLeafNames.Add($leaf) | Out-Null
+        }
+    }
+
+    $mdImgMatches = [regex]::Matches($mdText, '!\[[^\]]*\]\(([^\)]+)\)')
+    foreach ($m in $mdImgMatches) {
+        $src = $m.Groups[1].Value
+        $normalizedSrc = $src.Replace('/', '\\')
+        $leaf = [IO.Path]::GetFileName($normalizedSrc)
+        if (-not [string]::IsNullOrWhiteSpace($leaf) -and $seen.Add($leaf)) {
+            $orderedLeafNames.Add($leaf) | Out-Null
+        }
+    }
+
+    $oldToNew = @{}
+    $tempMoves = @()
+    $index = 1
+    foreach ($oldLeaf in $orderedLeafNames) {
+        $oldPath = Join-Path $ImagesDir $oldLeaf
+        if (-not (Test-Path -LiteralPath $oldPath)) {
+            continue
+        }
+
+        $ext = [IO.Path]::GetExtension($oldLeaf).ToLowerInvariant()
+        if ([string]::IsNullOrEmpty($ext)) {
+            $ext = '.png'
+        }
+
+        $newLeaf = ('{0:D3}{1}' -f $index, $ext)
+        $oldToNew[$oldLeaf] = $newLeaf
+
+        $tempLeaf = '__tmp__' + [guid]::NewGuid().ToString('N') + $ext
+        $tempPath = Join-Path $ImagesDir $tempLeaf
+        Rename-Item -LiteralPath $oldPath -NewName $tempLeaf
+
+        $tempMoves += [PSCustomObject]@{
+            TempLeaf = $tempLeaf
+            NewLeaf  = $newLeaf
+        }
+
+        $index++
+    }
+
+    foreach ($move in $tempMoves) {
+        $tempPath = Join-Path $ImagesDir $move.TempLeaf
+        $newPath = Join-Path $ImagesDir $move.NewLeaf
+        Rename-Item -LiteralPath $tempPath -NewName $move.NewLeaf
+    }
+
+    foreach ($oldLeaf in $oldToNew.Keys) {
+        $newLeaf = $oldToNew[$oldLeaf]
+        $escaped = [regex]::Escape($oldLeaf)
+
+        $mdText = [regex]::Replace(
+            $mdText,
+            '(?i)(<img\b[^>]*\bsrc=")([^"]*' + $escaped + ')(")',
+            '$1images/' + $newLeaf + '$3'
+        )
+
+        $mdText = [regex]::Replace(
+            $mdText,
+            '(?i)(!\[[^\]]*\]\()([^\)]*' + $escaped + ')(\))',
+            '$1images/' + $newLeaf + '$3'
+        )
+    }
+
+    [IO.File]::WriteAllText($MarkdownPath, $mdText, [Text.UTF8Encoding]::new($false))
+}
+
+if ([Threading.Thread]::CurrentThread.ApartmentState -ne [Threading.ApartmentState]::STA) {
+    Write-Error "このスクリプトは STA スレッドで実行する必要があります。`n例: powershell.exe -STA -File .\loop2md.ps1"
+    exit 1
+}
+
+if (-not (Get-Command pandoc -ErrorAction SilentlyContinue)) {
+    Write-Error "pandoc が見つかりません。PATH を確認してください。"
+    exit 1
+}
+
+$tmpdir = Join-Path $env:TEMP ("loop2md_" + [guid]::NewGuid())
+
+try {
+    New-Item -ItemType Directory -Path $tmpdir | Out-Null
+
+    if (-not (Test-Path -LiteralPath $OutDir)) {
+        New-Item -ItemType Directory -Path $OutDir -Force | Out-Null
+    }
+
+    # HTML Format を取得
+    if (-not [Windows.Forms.Clipboard]::ContainsData("HTML Format")) {
+        throw "Clipboard に HTML Format がありません。Loop ページをコピーしてください。"
+    }
+
+    $html = $null
+
+    # Prefer WPF API for Unicode-safe HTML retrieval from clipboard.
+    if ([System.Windows.Clipboard]::ContainsText([System.Windows.TextDataFormat]::Html)) {
+        $html = [System.Windows.Clipboard]::GetText([System.Windows.TextDataFormat]::Html)
+    }
+
+    # Fallback to WinForms raw data handling.
+    if ([string]::IsNullOrWhiteSpace($html)) {
+        $clipDataObj = [Windows.Forms.Clipboard]::GetDataObject()
+        $clipHtmlRaw = $clipDataObj.GetData("HTML Format", $false)
+
+        if ($clipHtmlRaw -is [byte[]]) {
+            $html = [Text.Encoding]::UTF8.GetString($clipHtmlRaw)
+        }
+        elseif ($clipHtmlRaw -is [IO.MemoryStream]) {
+            $html = [Text.Encoding]::UTF8.GetString($clipHtmlRaw.ToArray())
+        }
+        else {
+            $html = [string]$clipHtmlRaw
+        }
+    }
+
+    # Remove NUL if clipboard data came through unmanaged conversion path.
+    $html = $html -replace "`0", ""
+
+    # Repair only if the text still looks mojibake.
+    if ($html -match "縺|繧|繝|荳|螟|莉|譛") {
+        $html = Repair-MojibakeIfNeeded -Text $html
+    }
+
+    if ([string]::IsNullOrWhiteSpace($html)) {
+        throw "Clipboard の HTML Format が空です。"
+    }
+
+    # Abort unless clipboard content looks like it came from Microsoft Loop.
+    if ($html -notmatch '(?i)scriptor-paragraph|loop\.microsoft\.com|office\.com/loop') {
+        throw "Clipboard に Loop 由来と思われるデータがありません。Loop ページをコピーしてから実行してください。"
+    }
+
+    $html = Normalize-LoopCodeBlocks -Html $html
+
+    $htmlfile = Join-Path $tmpdir "input.html"
+
+    # Clipboard ヘッダ除去（大文字小文字を無視）
+    $start = $html.IndexOf("<html", [StringComparison]::OrdinalIgnoreCase)
+    if ($start -lt 0) {
+        $start = $html.IndexOf("<!doctype", [StringComparison]::OrdinalIgnoreCase)
+    }
+    if ($start -ge 0) {
+        $html = $html.Substring($start)
+    }
+
+    [IO.File]::WriteAllText(
+        $htmlfile,
+        $html,
+        [Text.UTF8Encoding]::new($true)
+    )
+
+    $baseName = $null
+    if ([string]::IsNullOrWhiteSpace($OutFileName)) {
+        $baseName = Get-AutoOutputBaseNameFromHtml -Html $html
+    }
+    else {
+        $requestedBaseName = [IO.Path]::GetFileNameWithoutExtension($OutFileName)
+        $baseName = Convert-ToSafeFileName -Name $requestedBaseName -DefaultName "output"
+    }
+
+    $outputFileName = $baseName + ".md"
+    $outmd = Join-Path $OutDir $outputFileName
+    $mediaDir = Join-Path $OutDir "images"
+
+    pandoc `
+        $htmlfile `
+        -f html `
+        -t gfm `
+        --wrap=none `
+        --extract-media="$mediaDir" `
+        -o $outmd
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "pandoc 実行に失敗しました。終了コード: $LASTEXITCODE"
+    }
+
+    Normalize-MarkdownAndImages -MarkdownPath $outmd -ImagesDir $mediaDir
+
+    Write-Host ""
+    Write-Host "Generated:"
+    Write-Host "  $outmd"
+    Write-Host "  $mediaDir"
+
+    [PSCustomObject]@{
+        MarkdownPath = $outmd
+        ImagesDir    = $mediaDir
+    }
+}
+finally {
+    if (Test-Path -LiteralPath $tmpdir) {
+        Remove-Item -LiteralPath $tmpdir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
