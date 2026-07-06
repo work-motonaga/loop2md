@@ -6,40 +6,24 @@ Microsoft Loop のページをクリップボード経由で取得し、Markdown
 
 - Loop で下書き・共同編集
 - クリップボードの HTML を直接 Markdown 化
-- 画像を `images/` にダウンロード
-- 画像参照を相対パスへ統一
-- 画像ファイル名を連番化（`001.png`, `002.png`, ...）
-- 出力 Markdown ファイル名を自動決定（Loop タイトル or 最初の見出し要素）
 
 ## できること
 
 - Loop 由来のクリップボード HTML を取得
-- Pandoc で Markdown へ変換
+- 画像を `images/` にダウンロード
+  - 画像参照を相対パスへ統一
+  - 画像ファイル名を連番化（`001.png`, `002.png`, ...）
+- 出力 Markdown ファイル名を自動決定（Loop タイトル or 最初の見出し要素）
 - 生成された不要な装飾の自動除去
   - 単独行の `\`
   - `<div class="scriptor-paragraph">` / `</div>`
-- 画像パスの正規化
-  - 絶対パスや UNC を `images/xxx.png` に置換
-- 画像ファイルの連番化
-  - 参照順に `001.png` から採番
-- 出力ファイル名の自動生成
-  - 優先順位: `<title>` → 最初の見出し要素（`h1`〜`h6` / `role="heading"`）→ `output.md`
-- UTF-8（BOM なし）で Markdown を保存
-
-## 想定ユースケース
-
-次のような場面で有効です。
-
-- Loop で教材本文を共同編集したい
-- Word / PowerPoint だけで手順書を作ると時間がかかる
-- Markdown を正本として管理したい
-- 画像注釈は後段（PowerPoint など）で行いたい
 
 ## 動作要件
 
 - Windows
 - PowerShell（Windows PowerShell 5.1 もしくは PowerShell 7 系）
 - Pandoc（PATH が通っていること）
+  - https://pandoc.org/installing.html
 - Microsoft Loop からページ内容をコピーできること
 
 ## ファイル構成
@@ -97,7 +81,7 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\loop2md.ps1 -OutD
 ### 3. 生成物を確認
 
 ```text
-lesson01/
+出力フォルダ/
 ├── 手順書.md
 └── images/
     ├── 001.png
@@ -114,7 +98,7 @@ lesson01/
 例:
 
 ```bat
-.\loop2md.bat -OutDir .\kensho01
+.\loop2md.bat -OutDir .\export
 ```
 
 ### `-OutFileName`
@@ -126,7 +110,7 @@ lesson01/
 例:
 
 ```bat
-.\loop2md.bat -OutDir .\kensho01 -OutFileName "lesson01"
+.\loop2md.bat -OutDir .\export -OutFileName "手順書"
 ```
 
 ## デバッグ
@@ -134,7 +118,7 @@ lesson01/
 自動ファイル名が期待どおりにならない場合は、現在のクリップボード HTML を保存して確認できます。
 
 ```powershell
-powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\save_clipboard_html.ps1 -OutFile .\kensho04\clipboard_dump.html
+powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\save_clipboard_html.ps1 -OutFile .\export\clipboard_dump.html
 ```
 
 このスクリプトは、`<title>` と見出し検出結果をコンソールに表示します。
@@ -161,15 +145,6 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File .\save_clipboard_ht
 - クリップボードに `HTML Format` がない
 - クリップボード内容が Loop 由来と判定できない
 - Pandoc の実行失敗
-
-## 推奨ワークフロー（GUI 操作手順書作成）
-
-1. スクリーンショット撮影
-2. Loop で本文編集
-3. 本ツールで Markdown + images 生成
-4. 必要に応じて PowerPoint 等で画像注釈
-5. Markdown 側の画像参照を差し替え
-6. Git 管理 / 配布用変換（HTML, PDF, Word など）
 
 ## 運用上の注意
 
